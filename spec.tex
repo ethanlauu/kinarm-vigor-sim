@@ -1,0 +1,126 @@
+\documentclass[10pt,letterpaper]{article}
+\usepackage[margin=0.60in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,microtype,amsmath,amssymb,booktabs,tabularx,array}
+\usepackage{xcolor,listings,enumitem,fancyhdr,hyperref}
+\definecolor{accent}{HTML}{116A68}
+\hypersetup{colorlinks=true,urlcolor=accent,linkcolor=accent,
+  pdftitle={KINARM Task Simulation: Implementation Specification}}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\setlength{\emergencystretch}{2em}
+\setlength{\abovedisplayskip}{4pt}
+\setlength{\belowdisplayskip}{4pt}
+\setlist{nosep,leftmargin=1.3em}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\lstset{basicstyle=\ttfamily\footnotesize,columns=fullflexible,
+  keepspaces=true,breaklines=true,showstringspaces=false,
+  aboveskip=3pt,belowskip=3pt,frame=none}
+\pagestyle{fancy}\fancyhf{}
+\fancyfoot[L]{\footnotesize Implementation proposal; defaults require pilot calibration}
+\fancyfoot[R]{\footnotesize\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\begin{document}
+\begin{center}
+{\large\bfseries KINARM Task Simulation: Implementation Specification}\\[-1pt]
+{\small Self-paced versus fixed-schedule reward collection \quad | \quad Version 0.1}
+\end{center}
+\vspace{-6pt}
+
+\textbf{Purpose.} Compare points-minus-effort control with an additional preference for earlier completion, then test predictions against human data. Implement the interfaces below; simulation code is not included. This is an idealized cursor model with an effort proxy, not measured metabolic energy or an energy-budget constraint.
+
+\textbf{Environment.} Implement \texttt{ReachEnv(gymnasium.Env)} with \texttt{Box(-1,1,(2,))} actions. One episode is one block. Defaults are provisional and shared between models.
+
+\begin{tabularx}{\linewidth}{@{}p{0.20\linewidth}Y@{}}
+\toprule
+Setting & Required behavior / default \\
+\midrule
+Clock and reward & $T=60$ s, $\Delta t=0.01$ s, $K=6000$. At reset independently sample uniform $S\in\{A,B\}$ and $q\in\{1,10\}$ points; hold fixed per block. Allow evaluation overrides. \\
+Targets & Radius $r=0.01$ m; initial $\mathbf x=\mathbf v=\mathbf0$. First center: distance $0.12$ m, uniform angle. Precompute 500 centers: uniformly draw $d\in\{0.08,0.12,0.16\}$ m and $\varphi\in[0,2\pi)$, set $\mathbf g'=\mathbf g+d(\cos\varphi,\sin\varphi)$; resample $(d,\varphi)$ until $\mathbf g'\in[-0.18,0.18]^2$. Hide future centers. \\
+Acquisition & One active target; require $h=0.15$ s continuous occupancy. Increment dwell only when both endpoints of a simulation step lie inside the current circle; otherwise reset dwell to zero. Award points once, after 15 valid steps. \\
+Schedule A & First target at $t=0$; replace immediately on acquisition. Replace an unacquired target after 10 s without reward. \\
+Schedule B & Onsets at $0,5,\ldots,55$ s, exactly 12 opportunities. Unacquired targets expire at the next onset. After success, hide the target and wait. No queue, late rewards, or advancing the onset clock. \\
+Between targets & Preserve position/velocity; physics and effort cost continue during waiting. No walls or per-reach resets. Log waiting movement. \\
+\bottomrule
+\end{tabularx}
+
+\textbf{Physics and observations.} For bounded action $\mathbf u_k\in[-1,1]^2$, use semi-implicit Euler integration:
+\[
+\mathbf v_{k+1}=\mathbf v_k+\frac{F_{\max}\mathbf u_k-b\mathbf v_k}{m}\Delta t,
+\qquad \mathbf x_{k+1}=\mathbf x_k+\mathbf v_{k+1}\Delta t,
+\quad m=1\text{ kg},\ b=10\text{ N\,s/m},\ F_{\max}=5\text{ N}.
+\]
+The plant has no noise/delay or position bounds; calibrate it later using pilot data. Return this 13-element float32 observation with unbounded observation-space limits:
+\[
+o_k=\left[\frac{\mathbf x_k}{0.20},\frac{\mathbf v_k}{0.50},
+\frac{\mathbf g_k}{0.20},z_k,\frac{h_k}{0.15},\frac{D_k}{10},
+\frac{w_k}{5},\frac{60-t_k}{60},\frac q{10},\mathbf 1\{S=B\}\right].
+\]
+Here $z$ indicates an active target, $h$ accumulated dwell, $D$ target age, and $w$ time to the next B onset (zero in A). During B waiting retain the last center/onset, set $z=h=0$, and update $D,w$. Reset: $D=h=0,z=1$; B starts with $w=5$.
+
+\textbf{Event ordering.} Use integer ticks: B interval 500, A timeout 1000, dwell 15. Integrate physics, charge effort, advance tick. At tick 6000 terminate before acquisition. Otherwise process due expiry/replacement before dwell/success; acquisitions exactly at expiry earn nothing. Reset dwell on replacement; never acquire a newly spawned target in the same step. Return \texttt{(obs,reward,terminated,False,info)} with \texttt{terminated=True} only at 6000. This finite task horizon is a true terminal state: no bootstrapping past it or external \texttt{TimeLimit} wrapper [3].
+
+\textbf{Objectives.} $I_k=1$ only on valid acquisition; $D_k^*$ is its target age, saved before replacement. Set $e_k=\|\mathbf u_k\|_2^2\Delta t$. For policy $\pi$, train
+\begin{align*}
+r_k^{\rm ext}&=q I_k-c e_k, &
+J_{\rm ext}(\pi)&=\mathbb E_\pi\!\left[\sum_{k=0}^{K-1}r_k^{\rm ext}\right],\\[-2pt]
+r_k^{\rm comp}&=q I_k-c e_k+I_k(\beta_0+\beta_1q)e^{-\kappa D_k^*}, &
+J_{\rm comp}(\pi)&=\mathbb E_\pi\!\left[\sum_{k=0}^{K-1}r_k^{\rm comp}\right].
+\end{align*}
+Defaults: $c=1$ point/s in both models; external $\beta_0=\beta_1=0$; completion $\beta_0=1$ point-equivalent, $\beta_1=0$, $\kappa=1\ {\rm s}^{-1}$. Configure all four; skip the exponential when $I_k=0$. Optional $\beta_1>0$ tests monetary amplification. The completion term is our hypothesis; Chew et al. [1] modeled satisfaction from skilled performance, not this speed preference. At $\kappa=0$ a constant bonus cannot favor earlier B completion at fixed success count; constant $\beta_0$ need not produce a B high--low reward effect.
+
+\textbf{Training.} Use Python 3.11+, Gymnasium, PyTorch, and Stable-Baselines3 PPO [2]. Each policy trains across all four $(S,q)$ conditions. Build \texttt{vec\_env} from eight independently seeded environments; separate target and exploration RNGs. Use the fixed observation scaling above, no reward normalization, and
+\begin{lstlisting}[language=Python]
+model = PPO("MlpPolicy", vec_env, device="cpu", seed=seed,
+    learning_rate=3e-4, n_steps=6000, batch_size=500, n_epochs=10,
+    gamma=1.0, gae_lambda=0.95, clip_range=0.2, ent_coef=0.0,
+    vf_coef=0.5, max_grad_norm=0.5,
+    policy_kwargs=dict(activation_fn=torch.nn.Tanh,
+                      net_arch=dict(pi=[64, 64], vf=[64, 64])))
+model.learn(total_timesteps=2_000_000)
+\end{lstlisting}
+Use seeds 0--4; record actual steps after rollout rounding. For sparse-reward learning apply identical potential shaping during training only:
+\[
+\widetilde r_k=r_k+\Phi(o_{k+1})-\Phi(o_k),
+\qquad \Phi(o)=-z\frac{\|\mathbf g-\mathbf x\|}{0.12},
+\qquad \Phi(o_{\rm terminal})=0.
+\]
+The added return is $-\Phi(o_0)$, independent of policy. Report unshaped utility and points. Keep $\gamma=1$ to avoid adding earlier-money preference to the baseline. Save curves, checkpoints every 240,000 transitions, and the final model; unreliable acquisition or unconverged training is a learning failure, not a human-behavior prediction.
+
+\textbf{Scripted benchmark and checks.} Before PPO, sweep $k_p\in\{10,25,50,100,200,400\}$ using
+\[
+\mathbf u=\operatorname{clip}_{[-1,1]}
+\left(\frac{k_p(\mathbf g-\mathbf x)-2\sqrt{m k_p}\,\mathbf v}{F_{\max}}\right)
+\quad(z=1),\qquad \mathbf u=\mathbf0\quad(z=0).
+\]
+Score all gains/objectives on 100 blocks per condition using shared evaluation seeds; this benchmark is not an exact optimum. Check: B presents 12 targets; expired targets cannot pay; all-success B earns $12q$ regardless of timing; A replaces immediately; waiting advances the clock; shaping telescopes; at $\kappa=0$, changing $\beta_0$ changes return only through success count.
+
+\textbf{Files / run contract.} \texttt{config.json}: all constants. \texttt{requirements.txt}: \texttt{numpy gymnasium torch stable-baselines3 pandas matplotlib scipy}. Implement \texttt{env.py} (environment/events), \texttt{baseline.py} (sweep/checks), \texttt{train.py} (model/seed loop), \texttt{evaluate.py} (metrics), \texttt{compare.py} (plots/human comparison). Required CLI, after implementation (PowerShell):
+\begin{lstlisting}
+python -m venv .venv
+$simpy = ".\.venv\Scripts\python.exe"
+& $simpy -m pip install -r requirements.txt
+& $simpy -m pip freeze > requirements-lock.txt
+& $simpy baseline.py --check --episodes 100 --out runs
+& $simpy train.py --model external --seeds 0 1 2 3 4 --steps 2000000 --out runs
+& $simpy train.py --model completion --seeds 0 1 2 3 4 --steps 2000000 --out runs
+& $simpy evaluate.py --root runs --episodes 100 --seed-start 100000
+& $simpy compare.py --root runs
+\end{lstlisting}
+Save configuration, package lock, checkpoints, curves, and evaluation outputs in \texttt{runs/<model>/seed\_<n>/}. Evaluate deterministically on 100 blocks per condition, reusing target seeds 100000--100099 across models/conditions/training seeds; exclude them from training.
+
+\textbf{Outputs.} \texttt{steps.npz}: block/target IDs, tick, $S,q$, $\mathbf x,\mathbf v,\mathbf u,\mathbf g,z,h$, points $qI$, completion bonus, $ce$, shaping, event. \texttt{trials.csv}: onset, actual starting distance, movement onset, final-dwell entry, acquisition/expiry, success/reason (distinguish block-end censoring). Movement onset: first speed $>0.005$ m/s sustained for three samples, backdated to the first; allow zero reaction time if already moving. Reaction time = movement onset $-$ target onset; MT = final-dwell entry $-$ movement onset; peak speed = maximum $\|\mathbf v\|$ during movement. Undefined events remain missing. \texttt{blocks.csv}: points, success count, waiting motion, unshaped utility.
+
+Plot MT and peak speed versus reward for each schedule, plus success, points, and learning curves. Compare high--low mean log-MT within each schedule and the difference between these effects; report seed variation and misses. Adjust for actual distance using bins $[0,.10),[.10,.14),[.14,\infty)$ m. All-success B earnings cannot distinguish models.
+
+\textbf{Later human fitting.} Use identical preprocessing; split human blocks before fitting. For matched distance bins minimize
+\[
+L(\theta)=\sum_{S,q,d}\sum_{j\in\{\log\mathrm{MT},\,v_{\rm peak}\}}
+\left(\frac{\mu^{\rm sim}_{Sqd,j}(\theta)-\mu^{\rm human,train}_{Sqd,j}}{s_j}\right)^2,
+\quad \theta=(c,\beta_0,\kappa),
+\]
+where $\mu$ is a bin mean and $s_j$ the training-human standard deviation; document skipped empty bins. Grid-search $c,\beta_0,\kappa\in\{.3,1,3\}$ as applicable, with $\beta_1=0$, using matched training budgets/seeds. Freeze selected parameters across all conditions before held-out evaluation. Add calibrated delay/noise before interpreting human reaction-time distributions or variability. Predictive fit does not establish PPO as a brain mechanism.
+
+\vspace{2pt}
+{\footnotesize\textbf{Sources.} [1] Chew et al. (2021), \href{https://www.jneurosci.org/content/41/43/8963}{\emph{A Neurocomputational Model for Intrinsic Reward}}, J. Neurosci. 41:8963--8971. [2] \href{https://stable-baselines3.readthedocs.io/en/master/modules/ppo.html}{Stable-Baselines3 PPO documentation}. [3] \href{https://gymnasium.farama.org/tutorials/gymnasium_basics/handling_time_limits/}{Gymnasium: Handling Time Limits}.}
+\end{document}
